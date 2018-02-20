@@ -2,6 +2,7 @@
 
 import os
 import math
+import numpy as np
 
 import rospy
 import rospkg
@@ -11,7 +12,7 @@ import actionlib
 from qt_gui_py_common.worker_thread import WorkerThread
 
 from python_qt_binding import loadUi, QtCore, QtWidgets
-from python_qt_binding.QtWidgets import QWidget
+from python_qt_binding.QtWidgets import QWidget, QMessageBox, QDialog
 from python_qt_binding.QtCore import Slot
 
 from frame_editor.editor import Frame, FrameEditor
@@ -38,6 +39,9 @@ class FrameEditorGUI(ProjectPlugin, Interface):
         self.file_type = "YAML files(*.yaml)"
 
         self.editor.parse_args(context.argv())
+        self.calib_base = "world"
+        self.calib_flange = ""
+        self.calib_storage = []
 
         # Update filename display
         self.update_current_filename()
@@ -121,6 +125,11 @@ class FrameEditorGUI(ProjectPlugin, Interface):
         widget.btn_rad.toggled.connect(self.update_fields)
 
         widget.combo_style.currentIndexChanged.connect(self.frame_style_changed)
+
+        widget.btn_calib_add.clicked.connect(self.btn_calib_add)
+        widget.btn_calib_calc.clicked.connect(self.btn_calib_calc)
+        widget.btn_calib_base.clicked.connect(self.btn_calib_base)
+        widget.btn_calib_flange.clicked.connect(self.btn_calib_flange)
 
         return widget
 
@@ -328,6 +337,98 @@ class FrameEditorGUI(ProjectPlugin, Interface):
             return
         self.editor.command(Command_RemoveElement(self.editor, self.editor.frames[item.text()]))
 
+    @Slot(bool)
+    def btn_calib_add(self, checked):
+        print "add"
+
+        if self.calib_flange == "":
+            print "ERROR no flange selected"
+            return
+
+        # TODO: better naming?
+        calib_frame_name = "_calib_{0:0>2}".format(len(self.calib_storage))
+
+        self.calib_storage.append(calib_frame_name)
+        self.editor.command(Command_CopyElement(self.editor, calib_frame_name,
+            self.calib_flange, self.calib_base))
+
+    @Slot(bool)
+    def btn_calib_base(self, checked):
+        existing_frames = set(self.editor.all_frame_ids())
+        if not existing_frames:
+            available_parents = ["world"]
+        else:
+            available_parents = self.editor.all_frame_ids(include_temp=False)
+            available_parents.append("world")
+        base_frame, ok = QtWidgets.QInputDialog.getItem(self.widget, "Choose Base frame",
+            "Frame Name:",
+            sorted(available_parents))
+        self.widget.line_calib_base.setText("Base Frame: {}".format(base_frame))
+        self.calib_base = base_frame
+
+    @Slot(bool)
+    def btn_calib_flange(self, checked):
+        existing_frames = set(self.editor.all_frame_ids())
+        if not existing_frames:
+            available_parents = []
+        else:
+            available_parents = self.editor.all_frame_ids(include_temp=False)
+        flange_frame, ok = QtWidgets.QInputDialog.getItem(self.widget, "Choose Flange frame",
+            "Frame Name:",
+            sorted(available_parents))
+        self.widget.line_calib_flange.setText("Flange Frame: {}".format(flange_frame))
+        self.calib_flange = flange_frame
+
+    @Slot(bool)
+    def btn_calib_calc(self, checked):
+        if len(self.calib_storage) < 4:
+            return
+
+        x, rad, residuals = self.calculate_tcp(self.calib_storage)
+
+        name, ok = QtWidgets.QInputDialog.getText(self.widget, "Add New TCP Frame", "Name:", QtWidgets.QLineEdit.Normal, "tcp_calibrated");
+
+        # Get a unique frame name
+        existing_frames = set(self.editor.all_frame_ids())
+
+        while ok and name in existing_frames:
+            # TODO: Replace or add new question?
+            name, ok = QtWidgets.QInputDialog.getText(self.widget, "Add New TCP Frame", "Name (must be unique):", QtWidgets.QLineEdit.Normal, "new_"+name)
+        if not ok:
+            return
+
+        #print x, rad
+        self.editor.command(Command_AddElement(self.editor, Frame(name,
+            position=(x[0], x[1], x[2]),
+            orientation=(0,0,0,1),
+            parent=self.calib_base)))
+
+        rospy.sleep(0.1) # TODO: Wait for transform?
+        self.editor.command(Command_SetParent(self.editor, self.editor.frames[name], self.calib_flange, True))
+
+        # TODO: Set sphere mesh with radius rad?
+        #self.editor.command(Command_SetStyle(self.editor, self.editor.active_frame, style))
+
+    def calculate_tcp(self, frames):
+        A = []
+        b = []
+        for f in frames:
+            A = A + [[1,
+                      self.editor.frames[f].position[0],
+                      self.editor.frames[f].position[1],
+                      self.editor.frames[f].position[2]]]
+
+            b = b + [[-1.0*
+                      (self.editor.frames[f].position[0]**2 +
+                       self.editor.frames[f].position[1]**2 +
+                       self.editor.frames[f].position[2]**2)]]
+                       #print "http://www.arndt-bruenner.de/mathe/scripts/kugel4p.htm"
+        res, residuals, _, _ = np.linalg.lstsq(np.matrix(A), np.matrix(b), rcond=None)
+
+        x = [-res[1]/2.0, -res[2]/2.0, -res[3]/2.0]
+
+        rad = np.sqrt(np.sum(np.power(x, 2))-res[0])
+        return x, rad, residuals
 
     ## PARENTING ##
     ##
